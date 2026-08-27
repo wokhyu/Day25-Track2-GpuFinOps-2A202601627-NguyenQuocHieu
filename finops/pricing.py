@@ -60,21 +60,87 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
+SPOT_INTERRUPT_RATE = {
+    # Per-hour chance a spot instance is reclaimed, by GPU type. Scarce
+    # datacenter parts are reclaimed less often than commodity inference cards:
+    # nobody outbids you for an H100 fleet on a whim, but A10G/L4 capacity is
+    # thin and churns constantly.
+    "B200": 0.02,
+    "H200": 0.03,
+    "H100": 0.03,
+    "MI300X": 0.04,
+    "A100": 0.05,
+    "A10G": 0.12,
+    "L4": 0.15,
+}
+DEFAULT_INTERRUPT_RATE = 0.05
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
+
+def interrupt_rate_for(gpu_type: str | None) -> float:
+    """Per-hour spot reclaim probability for a GPU type."""
+    return SPOT_INTERRUPT_RATE.get(gpu_type or "", DEFAULT_INTERRUPT_RATE)
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    spot_hr: float | None = None,
+    on_demand_hr: float | None = None,
+    reserved_hr: float | None = None,
+) -> str:
+    """Pick a purchasing tier from duty cycle, interruptibility and spot economics.
+
+    Base policy (unchanged, still the fallback when no prices are supplied):
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
+
+    Extension: 'spot' is no longer assumed to win just because a job can be
+    checkpointed. When spot/on-demand rates are supplied the choice is priced
+    out using the GPU type's own interruption rate, so a flaky commodity card
+    with a thin spot discount can lose to the steady tier on rework alone.
+    `job_days` is not used for the tier itself — commitment *length* is a
+    separate decision, see `recommend_commit_term`.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
+    steady_tier = "reserved" if duty >= be else "on_demand"
+
     if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
-        return "reserved"
-    return "on_demand"
+        if spot_hr is None or on_demand_hr is None or hours_per_day <= 0:
+            return "spot"  # no prices to reason with: keep the documented default
+        steady_hr = on_demand_hr
+        if steady_tier == "reserved" and reserved_hr is not None:
+            steady_hr = reserved_hr
+        sim = spot_checkpoint_cost(
+            hours_per_day, spot_hr, on_demand_hr,
+            interrupt_rate=interrupt_rate_for(gpu_type),
+        )
+        effective_spot_hr = sim["spot_cost"] / hours_per_day
+        if effective_spot_hr < steady_hr:
+            return "spot"
+        # rework ate the discount — fall through to the steady tier
+    return steady_tier
+
+
+def recommend_commit_term(job_days: float, days_in_month: float = 30.0) -> str:
+    """How long to commit for, given how much of the month the job actually stands up.
+
+    A reservation is a bet that the *same shape* of demand persists for the whole
+    term. Duty cycle answers "is it busy while it runs"; persistence answers "does
+    it keep running at all". Only a job that is effectively always-on earns a 3-year
+    lock — a half-month job that gets a 3-year commitment is buying idle capacity
+    for 35 months.
+    """
+    persistence = max(0.0, job_days) / max(1e-9, days_in_month)
+    if persistence >= 0.90:
+        return "3yr"
+    if persistence >= 0.50:
+        return "1yr"
+    return "none"
 
 
 def spot_checkpoint_cost(
@@ -102,3 +168,43 @@ def spot_checkpoint_cost(
         "on_demand_cost": round(on_demand_cost, 2),
         "savings_pct": round(savings_pct, 1),
     }
+
+
+# --- Extension 3: is the prompt cache actually paying for itself? -------------
+
+CACHE_WRITE_MULTIPLIER = 1.25  # Anthropic 5-min cache write ~1.25x the base input rate
+
+
+def cache_write_premium(base_price_per_m: float, write_multiplier: float = CACHE_WRITE_MULTIPLIER) -> float:
+    """Extra $/1M-token paid to *populate* the cache, above the normal input rate."""
+    return max(0.0, base_price_per_m * (write_multiplier - 1.0))
+
+
+def cache_break_even_reads(
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    base_price_per_m: float = 1.0,
+) -> float:
+    """How many cache reads a written prefix needs before caching turns a profit.
+
+    Writing costs a one-off premium; every subsequent read saves
+    (1 - read_discount) x the base input rate. Break-even is the ratio.
+    """
+    savings_per_read = base_price_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return float("inf")
+    return write_cost_per_m / savings_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    base_price_per_m: float = 1.0,
+) -> bool:
+    """True when the reads a prefix gets outrun the premium paid to cache it.
+
+    Caching is not free: a written prefix that is read back once or zero times
+    costs *more* than not caching at all. The lever is reuse, not the discount.
+    """
+    return avg_cache_reads > cache_break_even_reads(write_cost_per_m, read_discount, base_price_per_m)

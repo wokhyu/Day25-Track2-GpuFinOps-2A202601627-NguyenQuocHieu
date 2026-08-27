@@ -4,6 +4,14 @@ import csv
 import os
 import sys
 
+# Mission output and the generated report contain UTF-8 (Vietnamese analysis, unit
+# symbols). Windows consoles default to cp1252 and would raise on print().
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DATA = os.path.join(ROOT, "data")
